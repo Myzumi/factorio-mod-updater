@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 # External URL processing library
 # http://docs.python-requests.org/en/master/user/quickstart/
@@ -97,6 +98,7 @@ class ModUpdater:
         self.mod_path = mod_path
         self.timestamp = datetime.now(timezone.utc)
         self.title_mode = title_mode
+        self.added_dependencies = False
 
         # Get the credentials to download mods
         if settings_path is not None:
@@ -116,7 +118,7 @@ class ModUpdater:
         elif "service-username" in self.data:
             self.username = self.data["service-username"]
         else:
-            self.token = None
+            self.username = None
 
         if "token" in creds and creds["token"] is not None:
             self.token = creds["token"]
@@ -218,6 +220,10 @@ class ModUpdater:
         """
         print("Retrieving metadata", end="")
         for mod, data in self.mods.items():
+            if not data["enabled"]:
+                data["title"] = mod
+                data["deprecated"] = False
+                continue
             self._retrieve_mod_metadata(mod)
             print(".", end="", flush=True)
         print("complete!\n")
@@ -240,10 +246,13 @@ class ModUpdater:
                 entry["enabled"] = True
                 entry["installed"] = False
                 self.mods[mod] = entry
+                self.added_dependencies = True
                 self._retrieve_mod_metadata(mod)
                 print("Info: adding missing dependency {dep}".format(dep=mod))
 
         for mod, data in self.mods.items():
+            if not data["enabled"]:
+                continue
             if "metadata" not in data:
                 warnmsg = (
                     "Warning: Unable to retrieve metadata for"
@@ -258,9 +267,14 @@ class ModUpdater:
         """
         data = self.mods[mod]
         mod_url = self.mod_server_url + "/api/mods/" + mod + "/full"
-        with requests.get(mod_url) as req:
-            if req.status_code == 200:
-                data["metadata"] = req.json()
+        try:
+            with requests.get(mod_url, timeout=(10, 30)) as req:
+                if req.status_code == 200:
+                    data["metadata"] = req.json()
+                else:
+                    print("Warning: metadata for {} returned HTTP {}".format(mod, req.status_code))
+        except (requests.RequestException, ValueError) as error:
+            print("Warning: unable to retrieve metadata for {}: {}".format(mod, error))
 
         if "metadata" in data:
             # Find the latest release for this version of Factorio
@@ -317,6 +331,8 @@ class ModUpdater:
             for dep_name in data["dependencies"].keys():
                 if dep_name not in self.mods:
                     data["missing_deps"].append(dep_name)
+                elif not self.mods[dep_name]["enabled"]:
+                    print("Warning: enabled mod '{}' requires disabled mod '{}'; leaving it disabled".format(mod, dep_name))
 
     def _parse_mod_list(self):
         """Process the mod-list.json within mod_path."""
@@ -378,6 +394,10 @@ class ModUpdater:
         Generates an updated mod-list.json file which takes into account any
         newly added dependencies.
         """
+        # Only rewrite mod-list.json when we actually added dependencies.
+        if not self.added_dependencies:
+            return
+
         # Build the simplified object for json output
         mod_list_output = {}
         mod_list_output["mods"] = []
@@ -496,6 +516,8 @@ class ModUpdater:
         self._print_mod_message("Mod", "Version", "Action", "Result", "Message", None)
 
         for mod, data in self.mods.items():
+            if not data["enabled"]:
+                continue
             version = data["version"] if data["installed"] else "N/A"
             if "metadata" not in data:
                 self._print_mod_message(
@@ -521,8 +543,9 @@ class ModUpdater:
                 )
                 continue
 
-            self._prune_old_releases(mod)
-            self._download_latest_release(mod)
+            # Never remove the working ZIP before validating its replacement.
+            if self._download_latest_release(mod):
+                self._prune_old_releases(mod)
 
         # Update the mod list file
         self._update_mod_list()
@@ -539,10 +562,10 @@ class ModUpdater:
 
         # Declare the patterns
         mod_pattern = re.compile(
-            "^{mod}_({ver})[.]zip$".format(mod=mod, ver=self.MOD_VERSION_PATTERN)
+            "^{mod}_({ver})[.]zip$".format(mod=re.escape(mod), ver=self.MOD_VERSION_PATTERN)
         )
         version_pattern = re.compile(
-            "^{mod}_{ver}[.]zip$".format(mod=mod, ver=latest_version)
+            "^{mod}_{ver}[.]zip$".format(mod=re.escape(mod), ver=re.escape(latest_version))
         )
 
         # Build the parse list
@@ -578,80 +601,62 @@ class ModUpdater:
                 data=data,
             )
 
-    def _download_latest_release(self, mod: str):
-        """
-        Retrieves the latest version of the specified mod compatible with the
-        factorio release present on this server.
+    def _download_latest_release(self, mod: str) -> bool:
+        """Download safely to a temporary file and verify before replacing.
 
-        Keyword Arguments:
-        mod -- name of the target to update
+        Return True only when the latest archive is valid and ready to use.
         """
         data = self.mods[mod]
         latest = data["latest"]
         target = os.path.join(self.mod_path, latest["file_name"])
+        version = latest["version"]
 
-        validate = download = False
+        if os.path.isfile(target):
+            try:
+                if _validate_hash(latest["sha1"], target):
+                    self._print_mod_message(mod, version, "Validate", "Success", "", data)
+                    return True
+            except OSError as error:
+                print("Warning: unable to validate {}: {}".format(target, error))
 
-        v_cur = data["version"] if "version" in data else "N/A"
-        v_new = latest["version"]
-        if data["installed"]:
-            if v_new == v_cur:
-                validate = True
-            else:
-                message = "Updating from '{v_cur}'".format(v_cur=v_cur)
-                download = True
-        else:
-            message = "Downloading initial release '{v_new}'".format(v_new=v_new)
-            download = True
+        message = "Downloading release '{}'".format(version)
+        result = "Failure"
+        temporary_path = None
+        try:
+            url = self.mod_server_url + latest["download_url"]
+            credentials = {"username": self.username, "token": self.token}
+            with requests.get(url, params=credentials, stream=True, timeout=(10, 120)) as response:
+                if response.status_code != 200:
+                    message = ("Credentials rejected; check username/token" if response.status_code == 403
+                               else "Download returned HTTP {}".format(response.status_code))
+                    return False
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", dir=self.mod_path, prefix=".factorio-mod-",
+                    suffix=".tmp", delete=False
+                ) as temporary:
+                    temporary_path = temporary.name
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            temporary.write(chunk)
 
-        if validate:
-            if _validate_hash(latest["sha1"], target):
-                result = "Success"
-                message = "Deprecated mod" if data["deprecated"] else ""
-            else:
-                result = "Failure"
-                download = True
-                message = "Validation failed, downloading again"
-            self._print_mod_message(
-                mod=mod,
-                version=v_cur,
-                action="Validate",
-                result=result,
-                message=message,
-                data=data,
-            )
+            if not _validate_hash(latest["sha1"], temporary_path):
+                message = "Download failed SHA-1 validation; existing archive kept"
+                return False
 
-        if download:
-            creds = {"username": self.username, "token": self.token}
-            dl_url = self.mod_server_url + latest["download_url"]
-            with requests.get(dl_url, params=creds, stream=True) as req:
-                if req.status_code == 200:
-                    with open(target, "wb") as target_file:
-                        shutil.copyfileobj(req.raw, target_file)
-                        target_file.flush()
-                    if _validate_hash(latest["sha1"], target):
-                        result = "Success"
-                    else:
-                        result = "Failure"
-                        message = "Download did not match checksum!"
-                elif req.status_code == 403:
-                    message = (
-                        "Failed to download, credentials not accepted. "
-                        + "Check your username/token"
-                    )
-                    result = "Failure"
-                else:
-                    message = "Unable to retrieve, status code: " + str(req.status_code)
-                    result = "Failure"
-
-            self._print_mod_message(
-                mod=mod,
-                version=v_new,
-                action="Download",
-                result=result,
-                message=message,
-                data=data,
-            )
+            os.replace(temporary_path, target)
+            temporary_path = None
+            result = "Success"
+            return True
+        except (requests.RequestException, OSError) as error:
+            message = "Unable to download or save: {}".format(error)
+            return False
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
+            self._print_mod_message(mod, version, "Download", result, message, data)
 
 
 if __name__ == "__main__":
